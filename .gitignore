@@ -1,4 +1,3 @@
-/bin/
-/dist/
+/target/
 /.claude/
 *.vastx-partial
