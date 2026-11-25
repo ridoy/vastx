@@ -1,3 +1,4 @@
 /target/
 /.claude/
 *.vastx-partial
+__pycache__/
