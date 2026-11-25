@@ -28,6 +28,18 @@ enum Cmd {
         /// One of the names from `vastx models`; prompts if left out
         model: Option<String>,
     },
+    /// Rent a GPU for a model and wait until it's reachable over SSH
+    Up {
+        /// One of the names from `vastx models`; prompts if left out
+        model: Option<String>,
+    },
+    /// List the GPU instances vastx is running for you
+    Ps,
+    /// Destroy an instance so it stops billing
+    Down {
+        /// Instance id from `vastx ps`
+        id: u64,
+    },
 }
 
 // --- models ---
@@ -390,6 +402,22 @@ impl Http {
         Self::read(url, r.send_json(body)?)
     }
 
+    fn put(&self, url: &str, body: &Value) -> Result<Value> {
+        let mut r = self.agent.put(url);
+        if let Some(t) = &self.token {
+            r = r.header("Authorization", format!("Bearer {t}"));
+        }
+        Self::read(url, r.send_json(body)?)
+    }
+
+    fn delete(&self, url: &str) -> Result<Value> {
+        let mut r = self.agent.delete(url);
+        if let Some(t) = &self.token {
+            r = r.header("Authorization", format!("Bearer {t}"));
+        }
+        Self::read(url, r.call()?)
+    }
+
     fn read(url: &str, mut res: ureq::http::Response<ureq::Body>) -> Result<Value> {
         let status = res.status();
         let text = res.body_mut().read_to_string()?;
@@ -412,6 +440,11 @@ mod vast {
     use std::fmt;
 
     const API: &str = "https://console.vast.ai/api/v0";
+    /// Pinned so a new vLLM release can't break deployments. Built on CUDA 13.0.
+    pub const IMAGE: &str = "vllm/vllm-openai:v0.33.0";
+    const BILLING_PAGE: &str = "https://console.vast.ai/billing/";
+    /// Marks instances vastx created, so `ps` and `down` never touch anything else.
+    const LABEL_PREFIX: &str = "vastx:";
 
     pub struct Vast {
         pub key: String,
@@ -434,6 +467,48 @@ mod vast {
 
         pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
             self.http.post(&format!("{API}{path}"), body)
+        }
+
+        pub fn put(&self, path: &str, body: &Value) -> Result<Value> {
+            self.http.put(&format!("{API}{path}"), body)
+        }
+
+        /// Rents `offer` and returns the new instance's id.
+        pub fn rent(&self, offer: &Offer, model: &str, disk_gb: u64) -> Result<u64> {
+            let res = self
+                .put(&format!("/asks/{}/", offer.id), &rent_body(model, disk_gb))
+                .map_err(|e| {
+                    if e.to_string().contains("insufficient_credit") {
+                        anyhow::anyhow!(
+                            "your vast.ai account has no credit; add some at {BILLING_PAGE}"
+                        )
+                    } else {
+                        e
+                    }
+                })?;
+            res["new_contract"]
+                .as_u64()
+                .with_context(|| format!("vast.ai didn't return an instance id: {res}"))
+        }
+
+        /// The instances vastx created on this account.
+        pub fn instances(&self) -> Result<Vec<Instance>> {
+            let res = self.get("/instances/?owner=me")?;
+            Ok(res["instances"]
+                .as_array()
+                .context("vast.ai returned no instances list")?
+                .iter()
+                .filter_map(Instance::parse)
+                .collect())
+        }
+
+        pub fn instance(&self, id: u64) -> Result<Option<Instance>> {
+            Ok(self.instances()?.into_iter().find(|i| i.id == id))
+        }
+
+        pub fn destroy(&self, id: u64) -> Result<()> {
+            self.http.delete(&format!("{API}/instances/{id}/"))?;
+            Ok(())
         }
 
         /// Rentable single-GPU offers that meet `need`, cheapest first.
@@ -470,14 +545,64 @@ mod vast {
             "reliability": {"gte": 0.98},
             // Ampere or newer: current vLLM needs it for bf16 and its AWQ kernels.
             "compute_cap": {"gte": 800},
-            // Driver new enough for the CUDA 12.8 builds of the vLLM image.
-            "cuda_max_good": {"gte": 12.8},
+            // Driver new enough for IMAGE, which is built on CUDA 13.0.
+            "cuda_max_good": {"gte": 13.0},
             "order": [["dph_total", "asc"]],
             "type": "on-demand",
             "limit": 50,
             // Prices include storage, so ask for what will actually be allocated.
             "allocated_storage": need.disk_gb,
         })
+    }
+
+    pub(super) fn rent_body(model: &str, disk_gb: u64) -> Value {
+        json!({
+            "client_id": "me",
+            "image": IMAGE,
+            "disk": disk_gb,
+            "label": format!("{LABEL_PREFIX}{model}"),
+            // SSH straight to the host when it has open ports, through vast's proxy otherwise.
+            "runtype": "ssh_direc ssh_proxy",
+            // Fail right away if someone else rented the offer first, instead of queueing.
+            "cancel_unavail": true,
+        })
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Instance {
+        pub id: u64,
+        pub model: String,
+        pub gpu_name: String,
+        pub dph: f64,
+        /// vast's state: "loading" while the image pulls, then "running".
+        pub status: String,
+        /// vast's latest progress note, like "Pulling image".
+        pub status_msg: String,
+        pub ssh: Option<(String, u16)>,
+    }
+
+    impl Instance {
+        /// None for instances vastx didn't create.
+        pub(super) fn parse(v: &Value) -> Option<Self> {
+            let model = v["label"].as_str()?.strip_prefix(LABEL_PREFIX)?;
+            let direct = v["ports"]["22/tcp"][0]["HostPort"]
+                .as_str()
+                .and_then(|p| p.parse().ok())
+                .zip(v["public_ipaddr"].as_str().map(|h| h.trim().to_string()));
+            let proxy = v["ssh_port"]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .zip(v["ssh_host"].as_str().map(String::from));
+            Some(Self {
+                id: v["id"].as_u64()?,
+                model: model.into(),
+                gpu_name: v["gpu_name"].as_str().unwrap_or("?").into(),
+                dph: v["dph_total"].as_f64().unwrap_or(0.0),
+                status: v["actual_status"].as_str().unwrap_or("starting").into(),
+                status_msg: v["status_msg"].as_str().unwrap_or("").trim().into(),
+                ssh: direct.or(proxy).map(|(port, host)| (host, port)),
+            })
+        }
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -528,7 +653,7 @@ mod vast {
     }
 }
 
-use vast::{Need, Offer, Vast};
+use vast::{Instance, Need, Offer, Vast};
 
 // --- choosing a model and a GPU ---
 
@@ -556,7 +681,7 @@ fn disk_gb(info: &ModelInfo) -> u64 {
     info.weight_bytes.div_ceil(1_000_000_000) + 40
 }
 
-fn pick_offer(vast: &Vast, model: &Model) -> Result<Offer> {
+fn pick_offer(vast: &Vast, model: &Model) -> Result<(Offer, Need)> {
     let info = ModelInfo::fetch(&Http::new(env::var("HF_TOKEN").ok(), true), model)?;
     let need = Need {
         gpu_ram_mib: info.vram_bytes().div_ceil(1 << 20),
@@ -581,7 +706,7 @@ fn pick_offer(vast: &Vast, model: &Model) -> Result<Offer> {
         .items(shown)
         .default(0)
         .interact()?;
-    Ok(shown[i].clone())
+    Ok((shown[i].clone(), need))
 }
 
 fn require_login() -> Result<Config> {
@@ -594,11 +719,152 @@ fn require_login() -> Result<Config> {
 fn cmd_gpus(model: Option<&str>) -> Result<()> {
     let config = require_login()?;
     let model = pick_model(model)?;
-    let offer = pick_offer(&Vast::new(config.vast_api_key), model)?;
+    let (offer, _) = pick_offer(&Vast::new(config.vast_api_key), model)?;
     eprintln!(
-        "Picked {} in {} at ${:.3}/hr (offer {}). Renting it comes in the next version.",
-        offer.gpu_name, offer.location, offer.dph, offer.id
+        "Picked {} in {} at ${:.3}/hr (offer {}). Rent it with `vastx up {}`.",
+        offer.gpu_name, offer.location, offer.dph, offer.id, model.name
     );
+    Ok(())
+}
+
+// --- renting ---
+
+fn cmd_up(model: Option<&str>) -> Result<()> {
+    let config = require_login()?;
+    let vast = Vast::new(config.vast_api_key.clone());
+    let model = pick_model(model)?;
+    let (offer, need) = pick_offer(&vast, model)?;
+    let id = vast.rent(&offer, model.name, need.disk_gb)?;
+    eprintln!(
+        "Rented instance {id}: {} in {} at ${:.3}/hr.",
+        offer.gpu_name, offer.location, offer.dph
+    );
+    eprintln!("It bills until you run `vastx down {id}`, even if you stop vastx now.");
+    match wait_for_ssh(&vast, id, &config.ssh_key) {
+        Ok((host, port)) => {
+            eprintln!("Ready. Connect with:");
+            println!("{}", ssh_command(&config.ssh_key, &host, port).join(" "));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Instance {id} didn't come up: {e:#}");
+            let destroy = dialoguer::Confirm::new()
+                .with_prompt(format!("Destroy instance {id} so it stops billing?"))
+                .default(true)
+                .interact()?;
+            if destroy {
+                vast.destroy(id)?;
+                eprintln!("Destroyed instance {id}.");
+            } else {
+                eprintln!("Left it running; `vastx down {id}` destroys it.");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Polls until the instance runs and accepts SSH. The first start pulls the ~10 GB vLLM image,
+/// which can take several minutes on a slow host.
+fn wait_for_ssh(vast: &Vast, id: u64, key: &std::path::Path) -> Result<(String, u16)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
+    let mut last = String::new();
+    loop {
+        let inst = vast
+            .instance(id)?
+            .with_context(|| format!("instance {id} disappeared from your account"))?;
+        let note = if inst.status_msg.is_empty() {
+            inst.status.clone()
+        } else {
+            format!("{}: {}", inst.status, inst.status_msg)
+        };
+        if note != last {
+            eprintln!("  {note}");
+            last = note;
+        }
+        if inst.status == "exited" {
+            bail!("the instance exited ({})", inst.status_msg);
+        }
+        if let (true, Some((host, port))) = (inst.status == "running", inst.ssh.clone()) {
+            let ok = Command::new("ssh")
+                .args(ssh_command(key, &host, port).into_iter().skip(1))
+                .args(["-o", "ConnectTimeout=10", "true"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .context("running ssh")?
+                .success();
+            if ok {
+                return Ok((host, port));
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            bail!("timed out after 20 minutes");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+}
+
+/// vast reuses host:port pairs across instances, so a stored host key would soon mismatch.
+/// These machines are short-lived and reached by IP from vast's API, so host keys are not kept.
+fn ssh_command(key: &std::path::Path, host: &str, port: u16) -> Vec<String> {
+    [
+        "ssh",
+        "-i",
+        &key.to_string_lossy(),
+        "-p",
+        &port.to_string(),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "BatchMode=yes",
+        &format!("root@{host}"),
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+fn cmd_ps() -> Result<()> {
+    let config = require_login()?;
+    let instances = Vast::new(config.vast_api_key).instances()?;
+    if instances.is_empty() {
+        eprintln!("No vastx instances running.");
+        return Ok(());
+    }
+    println!(
+        "{:<10} {:<16} {:<16} {:<9} {:>9}  SSH",
+        "ID", "MODEL", "GPU", "STATUS", "$/HR"
+    );
+    for i in &instances {
+        println!("{}", ps_row(i));
+    }
+    Ok(())
+}
+
+fn ps_row(i: &Instance) -> String {
+    let ssh = match &i.ssh {
+        Some((host, port)) => format!("root@{host} -p {port}"),
+        None => "-".into(),
+    };
+    format!(
+        "{:<10} {:<16} {:<16} {:<9} {:>9.3}  {ssh}",
+        i.id, i.model, i.gpu_name, i.status, i.dph
+    )
+}
+
+fn cmd_down(id: u64) -> Result<()> {
+    let config = require_login()?;
+    let vast = Vast::new(config.vast_api_key);
+    // Only instances vastx created; anything else on the account is left alone.
+    if vast.instance(id)?.is_none() {
+        bail!("no vastx instance {id}; `vastx ps` lists them");
+    }
+    vast.destroy(id)?;
+    eprintln!("Destroyed instance {id}.");
     Ok(())
 }
 
@@ -607,7 +873,10 @@ fn main() -> Result<()> {
         Some(Cmd::Login) => drop(cmd_login()?),
         Some(Cmd::Models) => cmd_models()?,
         Some(Cmd::Gpus { model }) => cmd_gpus(model.as_deref())?,
-        None => cmd_gpus(None)?,
+        Some(Cmd::Up { model }) => cmd_up(model.as_deref())?,
+        Some(Cmd::Ps) => cmd_ps()?,
+        Some(Cmd::Down { id }) => cmd_down(id)?,
+        None => cmd_up(None)?,
     }
     Ok(())
 }
@@ -743,6 +1012,44 @@ mod tests {
             parsed[0].to_string(),
             "RTX 5060 Ti       16GB  $0.071/hr    926 Mbps  Malaysia, MY"
         );
+    }
+
+    #[test]
+    fn rent_body_labels_and_pins_image() {
+        let b = vast::rent_body("qwen3-8b-awq", 47);
+        assert_eq!(b["label"], "vastx:qwen3-8b-awq");
+        assert_eq!(b["image"], vast::IMAGE);
+        assert_eq!(b["disk"], 47);
+        assert_eq!(b["cancel_unavail"], true);
+    }
+
+    #[test]
+    fn parses_instances() {
+        let direct = json!({"id": 7, "label": "vastx:mistral-7b", "gpu_name": "RTX 3090",
+            "dph_total": 0.24, "actual_status": "running", "status_msg": "success, running\n",
+            "public_ipaddr": "1.2.3.4\n", "ports": {"22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "40022"}]},
+            "ssh_host": "ssh4.vast.ai", "ssh_port": 12345});
+        let i = Instance::parse(&direct).unwrap();
+        assert_eq!(i.model, "mistral-7b");
+        assert_eq!(i.status_msg, "success, running");
+        assert_eq!(i.ssh, Some(("1.2.3.4".into(), 40022)));
+        assert_eq!(
+            ps_row(&i),
+            "7          mistral-7b       RTX 3090         running       0.240  root@1.2.3.4 -p 40022"
+        );
+
+        let loading = json!({"id": 8, "label": "vastx:qwen2.5-1.5b", "actual_status": null,
+            "ssh_host": "ssh4.vast.ai", "ssh_port": 12345});
+        let i = Instance::parse(&loading).unwrap();
+        assert_eq!(i.status, "starting");
+        assert_eq!(i.ssh, Some(("ssh4.vast.ai".into(), 12345)));
+
+        for other in [
+            json!({"id": 9, "label": "my training run"}),
+            json!({"id": 10, "label": null}),
+        ] {
+            assert!(Instance::parse(&other).is_none());
+        }
     }
 
     #[test]
