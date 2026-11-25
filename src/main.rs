@@ -3,7 +3,6 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::{collections::HashSet, env, fs, path::PathBuf, process::Command};
 
-const VAST_API: &str = "https://console.vast.ai/api/v0";
 const VAST_KEYS_PAGE: &str = "https://console.vast.ai/manage-keys/";
 const HF: &str = "https://huggingface.co";
 const GIB: f64 = (1u64 << 30) as f64;
@@ -24,6 +23,11 @@ enum Cmd {
     Login,
     /// List the available models with their size and the GPU memory they need
     Models,
+    /// Find GPU offers that fit a model and pick one
+    Gpus {
+        /// One of the names from `vastx models`; prompts if left out
+        model: Option<String>,
+    },
 }
 
 // --- models ---
@@ -397,39 +401,213 @@ impl Http {
     }
 }
 
-struct Vast {
-    key: String,
-    http: Http,
-}
+// --- vast.ai ---
 
-impl Vast {
-    fn new(key: String) -> Self {
-        Self {
-            http: Http::new(Some(key.clone()), false),
-            key,
+mod vast {
+    //! vast.ai API client: account calls and GPU offer search.
+
+    use crate::Http;
+    use anyhow::{Context, Result};
+    use serde_json::{Value, json};
+    use std::fmt;
+
+    const API: &str = "https://console.vast.ai/api/v0";
+
+    pub struct Vast {
+        pub key: String,
+        http: Http,
+    }
+
+    impl Vast {
+        pub fn new(key: String) -> Self {
+            Self {
+                // No redirects: ureq drops the Authorization header on redirect, which would
+                // surface as a misleading "requires login". Paths need their trailing slash.
+                http: Http::new(Some(key.clone()), false),
+                key,
+            }
+        }
+
+        pub fn get(&self, path: &str) -> Result<Value> {
+            self.http.get(&format!("{API}{path}"))
+        }
+
+        pub fn post(&self, path: &str, body: &Value) -> Result<Value> {
+            self.http.post(&format!("{API}{path}"), body)
+        }
+
+        /// Rentable single-GPU offers that meet `need`, cheapest first.
+        pub fn offers(&self, need: &Need) -> Result<Vec<Offer>> {
+            let res = self.post("/bundles/", &offer_query(need))?;
+            let mut offers: Vec<Offer> = res["offers"]
+                .as_array()
+                .context("vast.ai offer search returned no offers list")?
+                .iter()
+                .filter_map(Offer::parse)
+                .collect();
+            rank(&mut offers);
+            Ok(offers)
         }
     }
 
-    fn get(&self, path: &str) -> Result<Value> {
-        self.http.get(&format!("{VAST_API}{path}"))
+    /// What a machine must have to serve a model.
+    pub struct Need {
+        pub gpu_ram_mib: u64,
+        pub disk_gb: u64,
     }
 
-    fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        self.http.post(&format!("{VAST_API}{path}"), body)
+    pub(super) fn offer_query(need: &Need) -> Value {
+        json!({
+            "verified": {"eq": true},
+            "external": {"eq": false},
+            "rentable": {"eq": true},
+            "rented": {"eq": false},
+            "num_gpus": {"eq": 1},
+            "gpu_ram": {"gte": need.gpu_ram_mib},
+            "disk_space": {"gte": need.disk_gb},
+            // Weights come over the network, so a slow link wastes paid GPU time.
+            "inet_down": {"gte": 500},
+            "reliability": {"gte": 0.98},
+            // Ampere or newer: current vLLM needs it for bf16 and its AWQ kernels.
+            "compute_cap": {"gte": 800},
+            // Driver new enough for the CUDA 12.8 builds of the vLLM image.
+            "cuda_max_good": {"gte": 12.8},
+            "order": [["dph_total", "asc"]],
+            "type": "on-demand",
+            "limit": 50,
+            // Prices include storage, so ask for what will actually be allocated.
+            "allocated_storage": need.disk_gb,
+        })
     }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Offer {
+        pub id: u64,
+        pub gpu_name: String,
+        pub gpu_ram_mib: u64,
+        /// Total price per hour, including the requested storage.
+        pub dph: f64,
+        pub inet_down_mbps: f64,
+        pub location: String,
+    }
+
+    impl Offer {
+        pub(super) fn parse(v: &Value) -> Option<Self> {
+            Some(Self {
+                id: v["id"].as_u64()?,
+                gpu_name: v["gpu_name"].as_str()?.into(),
+                gpu_ram_mib: v["gpu_ram"].as_f64()? as u64,
+                dph: v["dph_total"].as_f64()?,
+                inet_down_mbps: v["inet_down"].as_f64().unwrap_or(0.0),
+                location: v["geolocation"].as_str().unwrap_or("unknown").into(),
+            })
+        }
+    }
+
+    impl fmt::Display for Offer {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "{:<16} {:>3}GB  ${:.3}/hr  {:>5.0} Mbps  {}",
+                self.gpu_name,
+                self.gpu_ram_mib.div_ceil(1024),
+                self.dph,
+                self.inet_down_mbps,
+                self.location
+            )
+        }
+    }
+
+    /// Cheapest first; at the same price, the faster download wins.
+    pub(super) fn rank(offers: &mut [Offer]) {
+        offers.sort_by(|a, b| {
+            a.dph
+                .total_cmp(&b.dph)
+                .then(b.inet_down_mbps.total_cmp(&a.inet_down_mbps))
+        });
+    }
+}
+
+use vast::{Need, Offer, Vast};
+
+// --- choosing a model and a GPU ---
+
+fn pick_model(name: Option<&str>) -> Result<&'static Model> {
+    if let Some(name) = name {
+        return MODELS.iter().find(|m| m.name == name).with_context(|| {
+            let names: Vec<_> = MODELS.iter().map(|m| m.name).collect();
+            format!("unknown model {name:?}; choose one of {}", names.join(", "))
+        });
+    }
+    let items: Vec<String> = MODELS
+        .iter()
+        .map(|m| format!("{:<16} {}", m.name, m.repo))
+        .collect();
+    let i = dialoguer::Select::new()
+        .with_prompt("Model")
+        .items(&items)
+        .default(0)
+        .interact()?;
+    Ok(&MODELS[i])
+}
+
+/// Disk to allocate: the weights, the vLLM image (about 20 GB unpacked) and HF's download cache.
+fn disk_gb(info: &ModelInfo) -> u64 {
+    info.weight_bytes.div_ceil(1_000_000_000) + 40
+}
+
+fn pick_offer(vast: &Vast, model: &Model) -> Result<Offer> {
+    let info = ModelInfo::fetch(&Http::new(env::var("HF_TOKEN").ok(), true), model)?;
+    let need = Need {
+        gpu_ram_mib: info.vram_bytes().div_ceil(1 << 20),
+        disk_gb: disk_gb(&info),
+    };
+    eprintln!(
+        "{} needs {:.1} GB of GPU memory and {} GB of disk.",
+        model.name,
+        info.vram_bytes() as f64 / GIB,
+        need.disk_gb
+    );
+    let offers = vast.offers(&need)?;
+    if offers.is_empty() {
+        bail!(
+            "no vast.ai offers fit {} right now; try again in a few minutes",
+            model.name
+        );
+    }
+    let shown = &offers[..offers.len().min(5)];
+    let i = dialoguer::Select::new()
+        .with_prompt("GPU (cheapest first)")
+        .items(shown)
+        .default(0)
+        .interact()?;
+    Ok(shown[i].clone())
+}
+
+fn require_login() -> Result<Config> {
+    match Config::load()? {
+        Some(c) => Ok(c),
+        None => cmd_login(),
+    }
+}
+
+fn cmd_gpus(model: Option<&str>) -> Result<()> {
+    let config = require_login()?;
+    let model = pick_model(model)?;
+    let offer = pick_offer(&Vast::new(config.vast_api_key), model)?;
+    eprintln!(
+        "Picked {} in {} at ${:.3}/hr (offer {}). Renting it comes in the next version.",
+        offer.gpu_name, offer.location, offer.dph, offer.id
+    );
+    Ok(())
 }
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Some(Cmd::Login) => drop(cmd_login()?),
         Some(Cmd::Models) => cmd_models()?,
-        None => {
-            if Config::load()?.is_none() {
-                cmd_login()?;
-            }
-            cmd_models()?;
-            eprintln!("\nRenting a GPU and serving a model comes in the next version.");
-        }
+        Some(Cmd::Gpus { model }) => cmd_gpus(model.as_deref())?,
+        None => cmd_gpus(None)?,
     }
     Ok(())
 }
@@ -524,6 +702,57 @@ mod tests {
         // KV: 2 * 28 layers * 4 heads * 128 dim * 2 bytes * 8192 tokens = 448 MiB.
         let expected = (15.0 * GIB + 448.0 * 1024.0 * 1024.0 + 2.0 * GIB) / 0.9;
         assert_eq!(info.vram_bytes(), expected as u64);
+    }
+
+    #[test]
+    fn offer_query_carries_requirements() {
+        let q = vast::offer_query(&Need {
+            gpu_ram_mib: 10_000,
+            disk_gb: 46,
+        });
+        assert_eq!(q["gpu_ram"]["gte"], 10_000);
+        assert_eq!(q["disk_space"]["gte"], 46);
+        assert_eq!(q["allocated_storage"], 46);
+        assert_eq!(q["num_gpus"]["eq"], 1);
+        assert_eq!(q["compute_cap"]["gte"], 800);
+    }
+
+    #[test]
+    fn parses_and_ranks_offers() {
+        // Trimmed from a live /bundles/ response.
+        let offers = json!([
+            {"id": 61537938, "gpu_name": "RTX 3060", "gpu_ram": 12288, "dph_total": 0.078,
+             "inet_down": 1434.8, "geolocation": "Poland, PL"},
+            {"id": 60586610, "gpu_name": "RTX 5060 Ti", "gpu_ram": 16311, "dph_total": 0.071,
+             "inet_down": 926.1, "geolocation": "Malaysia, MY"},
+            {"id": 58397639, "gpu_name": "RTX 3060", "gpu_ram": 12288, "dph_total": 0.071,
+             "inet_down": 867.8},
+            {"id": "broken"}
+        ]);
+        let mut parsed: Vec<Offer> = offers
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Offer::parse)
+            .collect();
+        vast::rank(&mut parsed);
+        let ids: Vec<u64> = parsed.iter().map(|o| o.id).collect();
+        assert_eq!(ids, [60586610, 58397639, 61537938]);
+        assert_eq!(parsed[1].location, "unknown");
+        assert_eq!(
+            parsed[0].to_string(),
+            "RTX 5060 Ti       16GB  $0.071/hr    926 Mbps  Malaysia, MY"
+        );
+    }
+
+    #[test]
+    fn disk_covers_weights_and_image() {
+        let info = ModelInfo {
+            files: vec![],
+            weight_bytes: 15_200_000_000,
+            arch: Arch::from_config(&qwen_config()).unwrap(),
+        };
+        assert_eq!(disk_gb(&info), 56);
     }
 
     #[test]
