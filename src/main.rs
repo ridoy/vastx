@@ -187,7 +187,7 @@ impl Arch {
 }
 
 fn cmd_models() -> Result<()> {
-    let hf = Http::new(env::var("HF_TOKEN").ok());
+    let hf = Http::new(env::var("HF_TOKEN").ok(), true);
     println!(
         "{:<16} {:>8} {:>9}  {:<11} SOURCE",
         "MODEL", "SIZE", "GPU MEM", "LICENSE"
@@ -281,7 +281,7 @@ fn cmd_login() -> Result<Config> {
             .with_prompt("Paste your vast.ai API key")
             .interact()?;
         let vast = Vast::new(key.trim().to_string());
-        match vast.get("/users/current") {
+        match vast.get("/users/current/") {
             Ok(user) => {
                 let who = user["email"].as_str().or(user["username"].as_str());
                 eprintln!(
@@ -359,9 +359,12 @@ struct Http {
 }
 
 impl Http {
-    fn new(token: Option<String>) -> Self {
+    /// `follow_redirects` is off for vast.ai: ureq drops the Authorization header on redirect,
+    /// so a redirect would surface as a misleading "requires login" error.
+    fn new(token: Option<String>, follow_redirects: bool) -> Self {
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .max_redirects(if follow_redirects { 10 } else { 0 })
             .build()
             .into();
         Self { agent, token }
@@ -402,7 +405,7 @@ struct Vast {
 impl Vast {
     fn new(key: String) -> Self {
         Self {
-            http: Http::new(Some(key.clone())),
+            http: Http::new(Some(key.clone()), false),
             key,
         }
     }
