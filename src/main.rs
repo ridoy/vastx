@@ -1,11 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use std::{env, io, path::PathBuf, process::Command};
+use std::{env, io, process::Command};
 
 const S5CMD_VERSION: &str = "2.3.0";
 const CF_API: &str = "https://api.cloudflare.com/client/v4";
-const EXCLUDES: [&str; 3] = ["*/.git/*", "*/.cache/*", "*.DS_Store"];
 
 #[derive(Parser)]
 #[command(
@@ -19,14 +18,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Mirror a local model directory (or single file) to the bucket
-    Push {
-        path: PathBuf,
-        /// Defaults to the path's base name
-        name: Option<String>,
-        #[command(flatten)]
-        tuning: Tuning,
-    },
     /// Download a model using your own credentials
     Pull {
         name: String,
@@ -49,22 +40,14 @@ enum Cmd {
         #[command(flatten)]
         tuning: Tuning,
     },
-    /// List models and their sizes
-    Ls,
-    /// Delete a model
-    Rm {
-        name: String,
-        #[arg(short, long)]
-        yes: bool,
-    },
 }
 
 #[derive(clap::Args)]
 struct Tuning {
-    /// Files transferred in parallel [push: 4, pull: 32]
+    /// Files transferred in parallel
     #[arg(short, long)]
     workers: Option<u32>,
-    /// Parts transferred in parallel per file [push: 8, pull: 16]
+    /// Parts transferred in parallel per file
     #[arg(short, long)]
     concurrency: Option<u32>,
     /// Part size in MiB
@@ -86,7 +69,6 @@ impl Tuning {
     }
 }
 
-const PUSH: (u32, u32) = (4, 8);
 const PULL: (u32, u32) = (32, 16);
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -158,17 +140,6 @@ impl R2 {
             bail!("s5cmd failed ({status})");
         }
         Ok(())
-    }
-
-    fn output(&self, args: &[String]) -> Result<String> {
-        let out = self.s5(args).output().map_err(s5cmd_missing)?;
-        if !out.status.success() {
-            bail!(
-                "s5cmd failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     fn temp_credentials(&self, name: &str, hours: u64) -> Result<[String; 3]> {
@@ -268,45 +239,10 @@ fn bootstrap(creds: &[String; 3], argv: &[String], arch: Arch) -> String {
     )
 }
 
-fn confirm(prompt: &str) -> Result<bool> {
-    eprint!("{prompt} [y/N] ");
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let r2 = R2::from_env()?;
     match cli.cmd {
-        Cmd::Push { path, name, tuning } => {
-            let name = match name {
-                Some(n) => n,
-                None => path
-                    .canonicalize()?
-                    .file_name()
-                    .context("can't infer a name; pass one")?
-                    .to_string_lossy()
-                    .into(),
-            };
-            check_name(&name)?;
-            let src = path.to_string_lossy().into_owned();
-            let mut argv;
-            if path.is_dir() {
-                argv = tuning.argv(&r2, "sync", PUSH);
-                argv.push("--delete".into());
-                for e in EXCLUDES {
-                    argv.extend(["--exclude".into(), e.into()]);
-                }
-                argv.push(format!("{}/", src.trim_end_matches('/')));
-            } else {
-                argv = tuning.argv(&r2, "cp", PUSH);
-                argv.push(src);
-            }
-            argv.push(r2.url(&name));
-            r2.run(&argv)?;
-            eprintln!("pushed {name}; next: vastx share {name}");
-        }
         Cmd::Pull { name, dest, tuning } => {
             check_name(&name)?;
             let mut argv = tuning.argv(&r2, "sync", PULL);
@@ -335,35 +271,6 @@ fn main() -> Result<()> {
             ]);
             println!("{}", bootstrap(&creds, &argv, arch));
             eprintln!("credentials are read-only, limited to {name}/, and expire in {hours}h");
-        }
-        Cmd::Ls => {
-            let mut ls = r2.argv(None, "ls");
-            ls.push(format!("s3://{}/", r2.bucket));
-            for line in r2.output(&ls)?.lines() {
-                let Some(name) = line
-                    .trim()
-                    .strip_prefix("DIR")
-                    .map(|s| s.trim().trim_end_matches('/'))
-                else {
-                    continue;
-                };
-                let mut du = r2.argv(None, "du");
-                du.extend(["-H".into(), r2.url(name) + "*"]);
-                let du = r2.output(&du)?;
-                println!(
-                    "{name:<40} {}",
-                    du.split(':').next().unwrap_or_default().trim()
-                );
-            }
-        }
-        Cmd::Rm { name, yes } => {
-            check_name(&name)?;
-            if !yes && !confirm(&format!("delete {} from {}?", name, r2.bucket))? {
-                bail!("aborted");
-            }
-            let mut rm = r2.argv(None, "rm");
-            rm.push(r2.url(&name) + "*");
-            r2.run(&rm)?;
         }
     }
     Ok(())
