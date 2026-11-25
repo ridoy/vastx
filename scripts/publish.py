@@ -156,6 +156,16 @@ class Bucket:
         except subprocess.CalledProcessError as e:
             sys.exit(f"s5cmd failed: {(e.stderr or '').strip() or e}")
 
+    def run_batch(self, commands):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt") as f:
+            f.write("\n".join(commands) + "\n")
+            f.flush()
+            self.s5("--numworkers", "8", "run", f.name)
+
+    def keys(self, prefix):
+        r = self.s5("--json", "ls", self.url(f"{prefix}*"), capture=True, check=False)
+        return [json.loads(line)["key"] for line in r.stdout.splitlines() if line.strip()]
+
     def put_json(self, key, value, max_age):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(value, f, indent=1)
@@ -221,14 +231,17 @@ def cmd_add(a):
         return
     b = Bucket()
     # Files, then manifest, then catalog: a model is listed only once it is complete.
-    b.s5(
-        "--numworkers", "8", "sync", "-c", "8", "-p", "64", "--delete",
-        "--exclude", MANIFEST, "--exclude", "*/.cache/*", "--exclude", "*/.git/*",
-        "--exclude", ".*",
-        f"{root}/", b.url(f"{name}/"),
+    # Upload exactly the manifest's files; -s -u skips ones already there unchanged.
+    b.run_batch(
+        f'cp -s -u -c 8 -p 64 "{root / e["path"]}" "{b.url(f"{name}/{e["path"]}")}"'
+        for e in manifest["files"]
     )
     b.put_json(f"{name}/{MANIFEST}", manifest, max_age=60)
     b.put_json(CATALOG, upsert(b.catalog(), manifest), max_age=60)
+    keep = {b.url(f"{name}/{p}") for p in [MANIFEST, *(e["path"] for e in manifest["files"])]}
+    stale = [k for k in b.keys(f"{name}/") if k not in keep]
+    if stale:
+        b.run_batch(f'rm "{k}"' for k in stale)
     gb = manifest["bytes"] / 1e9
     print(f"published {name}: {gb:.1f} GB, {manifest['params'] / 1e9:.1f}B params", file=sys.stderr)
 
