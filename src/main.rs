@@ -227,8 +227,6 @@ fn cmd_models() -> Result<()> {
 #[derive(Debug, PartialEq)]
 struct Config {
     vast_api_key: String,
-    /// Private key used to reach rented machines; its .pub is registered with vast.
-    ssh_key: PathBuf,
 }
 
 impl Config {
@@ -249,20 +247,16 @@ impl Config {
         };
         let v: Value =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        Ok(match (v["vast_api_key"].as_str(), v["ssh_key"].as_str()) {
-            (Some(k), Some(s)) => Some(Self {
-                vast_api_key: k.into(),
-                ssh_key: s.into(),
-            }),
-            _ => None,
-        })
+        Ok(v["vast_api_key"].as_str().map(|k| Self {
+            vast_api_key: k.into(),
+        }))
     }
 
     fn save(&self) -> Result<()> {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
         let path = Self::path()?;
         fs::create_dir_all(path.parent().context("config path has no parent")?)?;
-        let body = json!({ "vast_api_key": self.vast_api_key, "ssh_key": self.ssh_key });
+        let body = json!({ "vast_api_key": self.vast_api_key });
         // The file holds an API key, so only the owner can read it.
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -310,42 +304,27 @@ fn cmd_login() -> Result<Config> {
         }
     };
 
-    let ssh_key = ssh_key()?;
-    let public = fs::read_to_string(ssh_key.with_extension("pub"))?;
-    if registered(&vast.get("/ssh/")?, &public) {
-        eprintln!(
-            "SSH key {} is already on your vast.ai account.",
-            ssh_key.display()
-        );
-    } else {
-        vast.post("/ssh/", &json!({ "ssh_key": public.trim() }))?;
-        eprintln!(
-            "Added SSH key {} to your vast.ai account.",
-            ssh_key.display()
-        );
-    }
-
+    ensure_ssh_key(&vast)?;
     let config = Config {
         vast_api_key: vast.key,
-        ssh_key,
     };
     config.save()?;
     eprintln!("Saved to {}.", Config::path()?.display());
     Ok(config)
 }
 
-/// The user's ed25519 or RSA key if they have one, otherwise a new key just for vastx.
-fn ssh_key() -> Result<PathBuf> {
-    let dir = home()?.join(".ssh");
-    for name in ["id_ed25519", "id_rsa"] {
-        let p = dir.join(name);
-        if p.exists() && p.with_extension("pub").exists() {
-            return Ok(p);
-        }
-    }
-    let p = dir.join("vastx_ed25519");
+/// vastx's own SSH key for rented machines. It has no passphrase because vastx runs commands
+/// over SSH without a terminal to prompt in, and the user's own key may be locked.
+fn ssh_key_path() -> Result<PathBuf> {
+    Ok(home()?.join(".ssh").join("vastx_ed25519"))
+}
+
+/// Creates vastx's SSH key if it's missing and makes sure vast.ai has it, so new instances
+/// accept it. Returns the private key's path.
+fn ensure_ssh_key(vast: &Vast) -> Result<PathBuf> {
+    let p = ssh_key_path()?;
     if !p.exists() {
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(p.parent().context("no .ssh directory")?)?;
         let status = Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "vastx", "-f"])
             .arg(&p)
@@ -354,6 +333,12 @@ fn ssh_key() -> Result<PathBuf> {
         if !status.success() {
             bail!("ssh-keygen failed ({status})");
         }
+        eprintln!("Created SSH key {} for rented machines.", p.display());
+    }
+    let public = fs::read_to_string(p.with_extension("pub"))?;
+    if !registered(&vast.get("/ssh/")?, &public) {
+        vast.post("/ssh/", &json!({ "ssh_key": public.trim() }))?;
+        eprintln!("Added SSH key {} to your vast.ai account.", p.display());
     }
     Ok(p)
 }
@@ -387,45 +372,56 @@ impl Http {
     }
 
     fn get(&self, url: &str) -> Result<Value> {
-        let mut r = self.agent.get(url);
-        if let Some(t) = &self.token {
-            r = r.header("Authorization", format!("Bearer {t}"));
-        }
-        Self::read(url, r.call()?)
+        self.send(url, || self.auth(self.agent.get(url)).call())
     }
 
     fn post(&self, url: &str, body: &Value) -> Result<Value> {
-        let mut r = self.agent.post(url);
-        if let Some(t) = &self.token {
-            r = r.header("Authorization", format!("Bearer {t}"));
-        }
-        Self::read(url, r.send_json(body)?)
+        self.send(url, || self.auth(self.agent.post(url)).send_json(body))
     }
 
     fn put(&self, url: &str, body: &Value) -> Result<Value> {
-        let mut r = self.agent.put(url);
-        if let Some(t) = &self.token {
-            r = r.header("Authorization", format!("Bearer {t}"));
-        }
-        Self::read(url, r.send_json(body)?)
+        self.send(url, || self.auth(self.agent.put(url)).send_json(body))
     }
 
     fn delete(&self, url: &str) -> Result<Value> {
-        let mut r = self.agent.delete(url);
-        if let Some(t) = &self.token {
-            r = r.header("Authorization", format!("Bearer {t}"));
-        }
-        Self::read(url, r.call()?)
+        self.send(url, || self.auth(self.agent.delete(url)).call())
     }
 
-    fn read(url: &str, mut res: ureq::http::Response<ureq::Body>) -> Result<Value> {
-        let status = res.status();
-        let text = res.body_mut().read_to_string()?;
-        if !status.is_success() {
-            let short: String = text.chars().take(300).collect();
-            bail!("{url}: {status}: {short}");
+    fn auth<B>(&self, r: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        match &self.token {
+            Some(t) => r.header("Authorization", format!("Bearer {t}")),
+            None => r,
         }
-        serde_json::from_str(&text).with_context(|| format!("{url}: response is not JSON"))
+    }
+
+    /// Sends a request, waiting and retrying when rate limited. vast.ai allows only a few
+    /// requests per second and says how long to wait in `retry_after`.
+    fn send(
+        &self,
+        url: &str,
+        request: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Value> {
+        for attempt in 1.. {
+            let mut res = request()?;
+            let status = res.status();
+            let text = res.body_mut().read_to_string()?;
+            if status == 429 && attempt < 6 {
+                let wait = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v["retry_after"].as_f64())
+                    .unwrap_or(5.0)
+                    .clamp(1.0, 60.0);
+                std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+                continue;
+            }
+            if !status.is_success() {
+                let short: String = text.chars().take(300).collect();
+                bail!("{url}: {status}: {short}");
+            }
+            return serde_json::from_str(&text)
+                .with_context(|| format!("{url}: response is not JSON"));
+        }
+        unreachable!()
     }
 }
 
@@ -543,6 +539,8 @@ mod vast {
             // Weights come over the network, so a slow link wastes paid GPU time.
             "inet_down": {"gte": 500},
             "reliability": {"gte": 0.98},
+            // Hosts in China usually can't reach Docker Hub or Hugging Face.
+            "geolocation": {"notin": ["CN"]},
             // Ampere or newer: current vLLM needs it for bf16 and its AWQ kernels.
             "compute_cap": {"gte": 800},
             // Driver new enough for IMAGE, which is built on CUDA 13.0.
@@ -734,16 +732,17 @@ fn cmd_up(model: Option<&str>) -> Result<()> {
     let vast = Vast::new(config.vast_api_key.clone());
     let model = pick_model(model)?;
     let (offer, need) = pick_offer(&vast, model)?;
+    let key = ensure_ssh_key(&vast)?;
     let id = vast.rent(&offer, model.name, need.disk_gb)?;
     eprintln!(
         "Rented instance {id}: {} in {} at ${:.3}/hr.",
         offer.gpu_name, offer.location, offer.dph
     );
     eprintln!("It bills until you run `vastx down {id}`, even if you stop vastx now.");
-    match wait_for_ssh(&vast, id, &config.ssh_key) {
+    match wait_for_ssh(&vast, id, &key) {
         Ok((host, port)) => {
             eprintln!("Ready. Connect with:");
-            println!("{}", ssh_command(&config.ssh_key, &host, port).join(" "));
+            println!("{}", ssh_command(&key, &host, port).join(" "));
             Ok(())
         }
         Err(e) => {
@@ -772,11 +771,7 @@ fn wait_for_ssh(vast: &Vast, id: u64, key: &std::path::Path) -> Result<(String, 
         let inst = vast
             .instance(id)?
             .with_context(|| format!("instance {id} disappeared from your account"))?;
-        let note = if inst.status_msg.is_empty() {
-            inst.status.clone()
-        } else {
-            format!("{}: {}", inst.status, inst.status_msg)
-        };
+        let note = status_note(&inst);
         if note != last {
             eprintln!("  {note}");
             last = note;
@@ -784,24 +779,49 @@ fn wait_for_ssh(vast: &Vast, id: u64, key: &std::path::Path) -> Result<(String, 
         if inst.status == "exited" {
             bail!("the instance exited ({})", inst.status_msg);
         }
+        // Docker errors (like a host that can't reach the registry) don't fix themselves.
+        if inst.status_msg.contains("Error response from daemon") {
+            bail!("the host couldn't start the image: {}", inst.status_msg);
+        }
         if let (true, Some((host, port))) = (inst.status == "running", inst.ssh.clone()) {
-            let ok = Command::new("ssh")
+            let out = Command::new("ssh")
                 .args(ssh_command(key, &host, port).into_iter().skip(1))
                 .args(["-o", "ConnectTimeout=10", "true"])
                 .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .context("running ssh")?
-                .success();
-            if ok {
+                .output()
+                .context("running ssh")?;
+            if out.status.success() {
                 return Ok((host, port));
+            }
+            // vast prints a welcome banner on stderr; the last line is ssh's actual error.
+            let err = String::from_utf8_lossy(&out.stderr);
+            let note = format!(
+                "waiting for SSH: {}",
+                err.lines().last().unwrap_or("no response")
+            );
+            if note != last {
+                eprintln!("  {note}");
+                last = note;
             }
         }
         if std::time::Instant::now() > deadline {
             bail!("timed out after 20 minutes");
         }
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+}
+
+/// One line of progress. Docker reports each image layer separately, so those collapse
+/// into "pulling image".
+fn status_note(i: &Instance) -> String {
+    let msg = &i.status_msg;
+    let layer = msg.len() >= 13
+        && msg.as_bytes()[12] == b':'
+        && msg[..12].bytes().all(|b| b.is_ascii_hexdigit());
+    match (msg.is_empty(), layer) {
+        (true, _) => i.status.clone(),
+        (_, true) => format!("{}: pulling image", i.status),
+        _ => format!("{}: {msg}", i.status),
     }
 }
 
@@ -822,6 +842,9 @@ fn ssh_command(key: &std::path::Path, host: &str, port: u16) -> Vec<String> {
         "LogLevel=ERROR",
         "-o",
         "BatchMode=yes",
+        // Only vastx's key: agent keys tried first can use up the server's auth attempts.
+        "-o",
+        "IdentitiesOnly=yes",
         &format!("root@{host}"),
     ]
     .map(String::from)
@@ -984,6 +1007,7 @@ mod tests {
         assert_eq!(q["allocated_storage"], 46);
         assert_eq!(q["num_gpus"]["eq"], 1);
         assert_eq!(q["compute_cap"]["gte"], 800);
+        assert_eq!(q["geolocation"]["notin"][0], "CN");
     }
 
     #[test]
@@ -1050,6 +1074,25 @@ mod tests {
         ] {
             assert!(Instance::parse(&other).is_none());
         }
+    }
+
+    #[test]
+    fn status_note_collapses_layers() {
+        let mut i = Instance::parse(
+            &json!({"id": 1, "label": "vastx:m", "actual_status": "loading",
+            "status_msg": "da997ea44e13: Verifying Checksum"}),
+        )
+        .unwrap();
+        assert_eq!(status_note(&i), "loading: pulling image");
+        i.status_msg = "f8ca4e3fe64a:".into();
+        assert_eq!(status_note(&i), "loading: pulling image");
+        i.status_msg = "success, running vllm/vllm-openai_v0.33.0/ssh".into();
+        assert_eq!(
+            status_note(&i),
+            "loading: success, running vllm/vllm-openai_v0.33.0/ssh"
+        );
+        i.status_msg.clear();
+        assert_eq!(status_note(&i), "loading");
     }
 
     #[test]
