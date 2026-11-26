@@ -1,37 +1,37 @@
 # vastx
 
-Tooling for renting cloud GPUs (vast.ai first) for LLM training and inference.
-Right now it loads model weights onto instances through a Cloudflare R2 bucket, using [s5cmd](https://github.com/peak/s5cmd) for the transfers.
+vastx makes it easy to run open models if you don't have a GPU. There are some other benefits but this is mostly just a recreational exercise for me.
 
 ## Setup
 
 ```sh
-brew install s5cmd
+git clone https://github.com/ridoy/vastx.git
+cd vastx
 cargo install --path .
-
-export VASTX_R2_ACCOUNT_ID=...          # Cloudflare account ID
-export VASTX_R2_ACCESS_KEY_ID=...       # R2 API token with Object Read & Write on the bucket
-export VASTX_R2_SECRET_ACCESS_KEY=...
-export VASTX_R2_BUCKET=...
-export CLOUDFLARE_API_TOKEN=...         # only for `share`; needs R2 write permission
 ```
 
 `VASTX_S3_ENDPOINT` points vastx at any other S3-compatible store.
 
 ## Usage
 
-```sh
-vastx push ~/models/llama-3.1-8b        # mirror a directory; unchanged files are skipped
-vastx share llama-3.1-8b                # prints a command to run on the instance
-vastx pull llama-3.1-8b [dest]          # pull with your own credentials
-vastx ls
-vastx rm llama-3.1-8b
+First time: just run `vastx`.
+1. Logs you in to vast.ai
+2. Prompts you to select a model (as of now, just qwen2.5-1.5b, qwen3-8b, mistral-7b or deepseek-r1-7b`)
+3. Pick a GPU from a couple rightsized options.
+4. Wait 3-4 minutes for the instance to start, download the model, install llama.cpp, start serving...
+5. You are now live. Prompt your chatbot through cURL! (at this point an example command will be printed)
+
+Some other commands:
+```
+vastx ps             # lists running instances
+vastx connect <id>   # connects to instance with id <id>
+vast down <id>       # destroys instance so you stop getting billed
 ```
 
-`share` mints temporary R2 credentials that are read-only, limited to the model's prefix, and expire after `--hours` (default 24, max 168).
-It prints one line that installs s5cmd if it's missing and syncs the model into `/workspace/models/<name>`.
-Paste it into the instance shell or a vast.ai onstart script, so your real keys never touch a rented machine.
+# What's next?
 
-Transfers are parallel across files (`-w`) and across parts within a file (`-c`, `-p` MiB).
-Defaults are conservative for push (memory use is roughly workers x concurrency x part size) and aggressive for pull.
-Re-running pull resumes at file granularity.
+- [ ] Better chat UI. Should basically open a shell that lets you send messages. cURLing it is a crappy UX
+- [ ] More models to select. E.g. providing a HuggingFace URL, object hosted on S3 or R2, local finetuned models...
+- [ ] Multi-GPU setups. Need to research this more, but in principle one should be able to split layers across machines to enable larger models.
+- [ ] Make it available on Homebrew. Because I want this readme to say "`brew install vastx && vastx` is all you need to run {Qwen, Kimi, Deepseek, etc...}". Or maybe "Chat with an open model in 3 minutes with `brew install vastx && vastx`"
+
