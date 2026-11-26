@@ -953,7 +953,7 @@ fn tunnel(m: &Model, id: u64, key: &std::path::Path, host: &str, port: u16) -> R
         name = m.name
     );
     println!(
-        "curl http://localhost:{local}/v1/chat/completions -H 'Content-Type: application/json' \
+        "curl -s http://localhost:{local}/v1/chat/completions -H 'Content-Type: application/json' \
          -d '{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}'",
         m.name
     );
