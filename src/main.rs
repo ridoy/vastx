@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
-use std::{collections::HashSet, env, fs, path::PathBuf, process::Command};
+use std::{env, fs, path::PathBuf, process::Command};
 
 const VAST_KEYS_PAGE: &str = "https://console.vast.ai/manage-keys/";
 const HF: &str = "https://huggingface.co";
@@ -28,13 +28,18 @@ enum Cmd {
         /// One of the names from `vastx models`; prompts if left out
         model: Option<String>,
     },
-    /// Rent a GPU for a model and wait until it's reachable over SSH
+    /// Rent a GPU, start a model on it and open a tunnel to it
     Up {
         /// One of the names from `vastx models`; prompts if left out
         model: Option<String>,
     },
     /// List the GPU instances vastx is running for you
     Ps,
+    /// Reopen the tunnel to a running instance, restarting the model server if needed
+    Connect {
+        /// Instance id from `vastx ps`
+        id: u64,
+    },
     /// Destroy an instance so it stops billing
     Down {
         /// Instance id from `vastx ps`
@@ -46,44 +51,69 @@ enum Cmd {
 
 struct Model {
     name: &'static str,
-    repo: &'static str,
-    /// Pinned so an upstream change can't break a deployment.
-    revision: &'static str,
+    /// GGUF weights llama.cpp serves, pinned so an upstream change can't break a deployment.
+    gguf_repo: &'static str,
+    gguf_file: &'static str,
+    gguf_revision: &'static str,
+    /// The original repo, read for config.json: the architecture numbers sizing needs.
+    base_repo: &'static str,
+    base_revision: &'static str,
     license: &'static str,
 }
 
 const MODELS: [Model; 4] = [
     Model {
         name: "qwen2.5-1.5b",
-        repo: "Qwen/Qwen2.5-1.5B-Instruct",
-        revision: "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+        gguf_repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+        gguf_file: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        gguf_revision: "91cad51170dc346986eccefdc2dd33a9da36ead9",
+        base_repo: "Qwen/Qwen2.5-1.5B-Instruct",
+        base_revision: "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
         license: "apache-2.0",
     },
     Model {
-        name: "qwen3-8b-awq",
-        repo: "Qwen/Qwen3-8B-AWQ",
-        revision: "4da05a8edb55c6046cce958586c33b61da07bb79",
+        name: "qwen3-8b",
+        gguf_repo: "Qwen/Qwen3-8B-GGUF",
+        gguf_file: "Qwen3-8B-Q4_K_M.gguf",
+        gguf_revision: "7c41481f57cb95916b40956ab2f0b139b296d974",
+        base_repo: "Qwen/Qwen3-8B",
+        base_revision: "b968826d9c46dd6066d109eabc6255188de91218",
         license: "apache-2.0",
     },
     Model {
         name: "mistral-7b",
-        repo: "mistralai/Mistral-7B-Instruct-v0.3",
-        revision: "c170c708c41dac9275d15a8fff4eca08d52bab71",
+        // Mistral publishes no GGUF; bartowski's conversion is the most used.
+        gguf_repo: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        gguf_file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+        gguf_revision: "61fd4167fff3ab01ee1cfe0da183fa27a944db48",
+        base_repo: "mistralai/Mistral-7B-Instruct-v0.3",
+        base_revision: "c170c708c41dac9275d15a8fff4eca08d52bab71",
         license: "apache-2.0",
     },
     Model {
         name: "deepseek-r1-7b",
-        repo: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-        revision: "916b56a44061fd5cd7d6a8fb632557ed4f724f60",
+        // DeepSeek publishes no GGUF; bartowski's conversion is the most used.
+        gguf_repo: "bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF",
+        gguf_file: "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
+        gguf_revision: "361004151d4f4f6b446dc5e6d46fbf4422a80d5f",
+        base_repo: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+        base_revision: "916b56a44061fd5cd7d6a8fb632557ed4f724f60",
         license: "mit",
     },
 ];
 
+impl Model {
+    fn gguf_url(&self) -> String {
+        format!(
+            "{HF}/{}/resolve/{}/{}",
+            self.gguf_repo, self.gguf_revision, self.gguf_file
+        )
+    }
+}
+
 /// What vastx needs to know about a model before renting a GPU for it.
 #[derive(Debug, PartialEq)]
 struct ModelInfo {
-    /// Files to download: the weights vLLM loads plus config and tokenizer files.
-    files: Vec<(String, u64)>,
     weight_bytes: u64,
     arch: Arch,
 }
@@ -96,61 +126,29 @@ struct Arch {
     max_context: u64,
 }
 
-const SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
-
 impl ModelInfo {
     fn fetch(hf: &Http, m: &Model) -> Result<Self> {
-        let base = format!("{HF}/{}/resolve/{}", m.repo, m.revision);
         let tree = hf.get(&format!(
-            "{HF}/api/models/{}/tree/{}?recursive=true",
-            m.repo, m.revision
+            "{HF}/api/models/{}/tree/{}",
+            m.gguf_repo, m.gguf_revision
         ))?;
-        let index = if tree_files(&tree).any(|(p, _)| p == SAFETENSORS_INDEX) {
-            Some(hf.get(&format!("{base}/{SAFETENSORS_INDEX}"))?)
-        } else {
-            None
-        };
-        let config = hf.get(&format!("{base}/config.json"))?;
-        Self::from_parts(&tree, index.as_ref(), &config)
-            .with_context(|| format!("reading {} from Hugging Face", m.repo))
+        let config = hf.get(&format!(
+            "{HF}/{}/resolve/{}/config.json",
+            m.base_repo, m.base_revision
+        ))?;
+        Self::from_parts(&tree, m.gguf_file, &config)
+            .with_context(|| format!("reading {} from Hugging Face", m.name))
     }
 
-    fn from_parts(tree: &Value, index: Option<&Value>, config: &Value) -> Result<Self> {
-        // Some repos ship the weights twice (Mistral has consolidated.safetensors next to the
-        // HF shards). When there's an index, only the shards it lists are weights.
-        let weights: HashSet<&str> = match index {
-            Some(ix) => ix["weight_map"]
-                .as_object()
-                .context("safetensors index has no weight_map")?
-                .values()
-                .filter_map(Value::as_str)
-                .collect(),
-            None => tree_files(tree)
-                .map(|(p, _)| p)
-                .filter(|p| *p == "model.safetensors")
-                .collect(),
-        };
-        if weights.is_empty() {
-            bail!("no safetensors weights found");
-        }
-        let support = |p: &str| {
-            !p.contains('/')
-                && !p.starts_with("consolidated")
-                && [".json", ".model", ".tiktoken", ".txt"]
-                    .iter()
-                    .any(|ext| p.ends_with(ext))
-        };
-        let files: Vec<(String, u64)> = tree_files(tree)
-            .filter(|(p, _)| weights.contains(p) || support(p))
-            .map(|(p, s)| (p.to_string(), s))
-            .collect();
-        let weight_bytes = files
-            .iter()
-            .filter(|(p, _)| weights.contains(p.as_str()))
-            .map(|(_, s)| s)
-            .sum();
+    fn from_parts(tree: &Value, gguf_file: &str, config: &Value) -> Result<Self> {
+        let weight_bytes = tree
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["path"] == gguf_file)
+            .and_then(|e| e["size"].as_u64())
+            .with_context(|| format!("{gguf_file} is not in the repo"))?;
         Ok(Self {
-            files,
             weight_bytes,
             arch: Arch::from_config(config)?,
         })
@@ -161,22 +159,13 @@ impl ModelInfo {
         self.arch.max_context.min(8192)
     }
 
-    /// GPU memory needed to serve with vLLM at `context()`: weights, an fp16 KV cache for one
-    /// full sequence, and 2 GiB for activations and CUDA graphs, at vLLM's default 90% memory
-    /// utilization. Uses file bytes, so quantized weights need no special case.
+    /// GPU memory llama.cpp needs at `context()`: the GGUF weights, an fp16 KV cache for the
+    /// full context, and 1 GiB for the CUDA context and compute buffers.
     fn vram_bytes(&self) -> u64 {
         let a = &self.arch;
         let kv = 2 * a.layers * a.kv_heads * a.head_dim * 2 * self.context();
-        ((self.weight_bytes + kv + 2 * (1 << 30)) as f64 / 0.9) as u64
+        self.weight_bytes + kv + (1 << 30)
     }
-}
-
-fn tree_files(tree: &Value) -> impl Iterator<Item = (&str, u64)> {
-    tree.as_array()
-        .into_iter()
-        .flatten()
-        .filter(|e| e["type"] == "file")
-        .filter_map(|e| Some((e["path"].as_str()?, e["size"].as_u64()?)))
 }
 
 impl Arch {
@@ -211,12 +200,13 @@ fn cmd_models() -> Result<()> {
     for m in &MODELS {
         let info = ModelInfo::fetch(&hf, m)?;
         println!(
-            "{:<16} {:>6.1}GB {:>7.1}GB  {:<11} {}",
+            "{:<16} {:>6.1}GB {:>7.1}GB  {:<11} {}/{}",
             m.name,
             info.weight_bytes as f64 / GIB,
             info.vram_bytes() as f64 / GIB,
             m.license,
-            m.repo
+            m.gguf_repo,
+            m.gguf_file
         );
     }
     Ok(())
@@ -436,8 +426,8 @@ mod vast {
     use std::fmt;
 
     const API: &str = "https://console.vast.ai/api/v0";
-    /// Pinned so a new vLLM release can't break deployments. Built on CUDA 13.0.
-    pub const IMAGE: &str = "vllm/vllm-openai:v0.33.0";
+    /// A bare image starts in about 30 s; vastx installs llama.cpp itself (see `setup_script`).
+    pub const IMAGE: &str = "ubuntu:24.04";
     const BILLING_PAGE: &str = "https://console.vast.ai/billing/";
     /// Marks instances vastx created, so `ps` and `down` never touch anything else.
     const LABEL_PREFIX: &str = "vastx:";
@@ -541,10 +531,10 @@ mod vast {
             "reliability": {"gte": 0.98},
             // Hosts in China usually can't reach Docker Hub or Hugging Face.
             "geolocation": {"notin": ["CN"]},
-            // Ampere or newer: current vLLM needs it for bf16 and its AWQ kernels.
+            // Ampere or newer: fast fp16 and a GPU recent enough for any engine vastx adds.
             "compute_cap": {"gte": 800},
-            // Driver new enough for IMAGE, which is built on CUDA 13.0.
-            "cuda_max_good": {"gte": 13.0},
+            // Driver new enough for llama.cpp's CUDA 12.8 build.
+            "cuda_max_good": {"gte": 12.8},
             "order": [["dph_total", "asc"]],
             "type": "on-demand",
             "limit": 50,
@@ -664,7 +654,7 @@ fn pick_model(name: Option<&str>) -> Result<&'static Model> {
     }
     let items: Vec<String> = MODELS
         .iter()
-        .map(|m| format!("{:<16} {}", m.name, m.repo))
+        .map(|m| format!("{:<16} {}", m.name, m.base_repo))
         .collect();
     let i = dialoguer::Select::new()
         .with_prompt("Model")
@@ -674,9 +664,9 @@ fn pick_model(name: Option<&str>) -> Result<&'static Model> {
     Ok(&MODELS[i])
 }
 
-/// Disk to allocate: the weights, the vLLM image (about 20 GB unpacked) and HF's download cache.
+/// Disk to allocate: the weights plus room for the OS and llama.cpp (about 1 GB).
 fn disk_gb(info: &ModelInfo) -> u64 {
-    info.weight_bytes.div_ceil(1_000_000_000) + 40
+    info.weight_bytes.div_ceil(1_000_000_000) + 10
 }
 
 fn pick_offer(vast: &Vast, model: &Model) -> Result<(Offer, Need)> {
@@ -739,11 +729,17 @@ fn cmd_up(model: Option<&str>) -> Result<()> {
         offer.gpu_name, offer.location, offer.dph
     );
     eprintln!("It bills until you run `vastx down {id}`, even if you stop vastx now.");
-    match wait_for_ssh(&vast, id, &key) {
+    let started = std::time::Instant::now();
+    let ready = wait_for_ssh(&vast, id, &key)
+        .and_then(|(host, port)| setup(model, &key, &host, port).map(|()| (host, port)));
+    match ready {
         Ok((host, port)) => {
-            eprintln!("Ready. Connect with:");
-            println!("{}", ssh_command(&key, &host, port).join(" "));
-            Ok(())
+            eprintln!(
+                "{} is up after {:.0}s.",
+                model.name,
+                started.elapsed().as_secs_f64()
+            );
+            tunnel(model, id, &key, &host, port)
         }
         Err(e) => {
             eprintln!("Instance {id} didn't come up: {e:#}");
@@ -765,16 +761,19 @@ fn cmd_up(model: Option<&str>) -> Result<()> {
 /// Polls until the instance runs and accepts SSH. The first start pulls the ~10 GB vLLM image,
 /// which can take several minutes on a slow host.
 fn wait_for_ssh(vast: &Vast, id: u64, key: &std::path::Path) -> Result<(String, u16)> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
-    let mut last = String::new();
+    let now = std::time::Instant::now;
+    let deadline = now() + std::time::Duration::from_secs(20 * 60);
+    // Status and SSH notes are tracked apart so they don't reprint each other every poll.
+    let (mut last_status, mut last_ssh) = (String::new(), String::new());
+    let mut running_since = None;
     loop {
         let inst = vast
             .instance(id)?
             .with_context(|| format!("instance {id} disappeared from your account"))?;
         let note = status_note(&inst);
-        if note != last {
+        if note != last_status {
             eprintln!("  {note}");
-            last = note;
+            last_status = note;
         }
         if inst.status == "exited" {
             bail!("the instance exited ({})", inst.status_msg);
@@ -784,6 +783,7 @@ fn wait_for_ssh(vast: &Vast, id: u64, key: &std::path::Path) -> Result<(String, 
             bail!("the host couldn't start the image: {}", inst.status_msg);
         }
         if let (true, Some((host, port))) = (inst.status == "running", inst.ssh.clone()) {
+            let since = *running_since.get_or_insert_with(now);
             let out = Command::new("ssh")
                 .args(ssh_command(key, &host, port).into_iter().skip(1))
                 .args(["-o", "ConnectTimeout=10", "true"])
@@ -795,16 +795,20 @@ fn wait_for_ssh(vast: &Vast, id: u64, key: &std::path::Path) -> Result<(String, 
             }
             // vast prints a welcome banner on stderr; the last line is ssh's actual error.
             let err = String::from_utf8_lossy(&out.stderr);
-            let note = format!(
-                "waiting for SSH: {}",
-                err.lines().last().unwrap_or("no response")
-            );
-            if note != last {
+            let reason = err.lines().last().unwrap_or("no response");
+            let note = format!("waiting for SSH: {reason}");
+            if note != last_ssh {
                 eprintln!("  {note}");
-                last = note;
+                last_ssh = note;
+            }
+            // Healthy hosts accept the key within seconds of running. Some never do.
+            if reason.contains("Permission denied")
+                && since.elapsed() > std::time::Duration::from_secs(3 * 60)
+            {
+                bail!("the host never accepted the SSH key");
             }
         }
-        if std::time::Instant::now() > deadline {
+        if now() > deadline {
             bail!("timed out after 20 minutes");
         }
         std::thread::sleep(std::time::Duration::from_secs(10));
@@ -849,6 +853,149 @@ fn ssh_command(key: &std::path::Path, host: &str, port: u16) -> Vec<String> {
     ]
     .map(String::from)
     .to_vec()
+}
+
+// --- serving ---
+
+/// Pinned llama.cpp release; its CUDA 12.8 build runs on any driver vast's filter allows.
+const LLAMA_RELEASE: &str = "b12777";
+/// llama-server's port on the instance. It listens on localhost only and is reached through
+/// the SSH tunnel, so nothing is exposed to the internet.
+const REMOTE_PORT: u16 = 8080;
+
+/// Shell script that installs llama.cpp, downloads the model and starts llama-server. Every step
+/// is skipped when already done, so `vastx connect` can rerun it safely.
+fn setup_script(m: &Model, context: u64) -> String {
+    let rel = format!("https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_RELEASE}");
+    let build = "bin-ubuntu-cuda-12.8-x64.tar.gz";
+    let gguf = format!("/workspace/models/{}", m.gguf_file);
+    format!(
+        r#"set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v curl >/dev/null || ! dpkg -s libgomp1 >/dev/null 2>&1; then
+  echo "Installing system packages"
+  apt-get update -qq && apt-get install -y -qq curl ca-certificates libgomp1 >/dev/null
+fi
+if [ ! -x /opt/llama/llama-server ]; then
+  echo "Installing llama.cpp {LLAMA_RELEASE}"
+  mkdir -p /opt/llama
+  curl -fsSL --retry 3 {rel}/llama-{LLAMA_RELEASE}-{build} | tar xz -C /opt/llama --strip-components=1
+  curl -fsSL --retry 3 {rel}/cudart-llama-{LLAMA_RELEASE}-{build} | tar xz -C /opt/llama --strip-components=1
+fi
+if [ ! -f {gguf} ]; then
+  echo "Downloading {file} from Hugging Face"
+  mkdir -p /workspace/models
+  curl -fL --retry 3 -C - -# -o {gguf}.part {url}
+  mv {gguf}.part {gguf}
+fi
+if ! curl -sf http://127.0.0.1:{port}/health >/dev/null; then
+  echo "Starting llama-server"
+  pkill -f /opt/llama/llama-server || true
+  cd /opt/llama
+  LD_LIBRARY_PATH=/opt/llama nohup ./llama-server -m {gguf} --alias {name} -ngl 999 \
+    -c {context} --host 127.0.0.1 --port {port} >/workspace/llama-server.log 2>&1 &
+  for _ in $(seq 1 600); do
+    curl -sf http://127.0.0.1:{port}/health >/dev/null && exit 0
+    kill -0 $! 2>/dev/null || break
+    sleep 0.5
+  done
+  echo "llama-server didn't start; last lines of /workspace/llama-server.log:" >&2
+  tail -20 /workspace/llama-server.log >&2
+  exit 1
+fi
+"#,
+        file = m.gguf_file,
+        url = m.gguf_url(),
+        name = m.name,
+        port = REMOTE_PORT,
+    )
+}
+
+/// Runs `setup_script` on the instance, showing its progress in this terminal.
+fn setup(m: &Model, key: &std::path::Path, host: &str, port: u16) -> Result<()> {
+    use std::io::Write;
+    let info = ModelInfo::fetch(&Http::new(env::var("HF_TOKEN").ok(), true), m)?;
+    let mut child = Command::new("ssh")
+        .args(ssh_command(key, host, port).into_iter().skip(1))
+        .arg("bash -s")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("running ssh")?;
+    child
+        .stdin
+        .take()
+        .context("ssh has no stdin")?
+        .write_all(setup_script(m, info.context()).as_bytes())?;
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("setting up {} failed ({status})", m.name);
+    }
+    Ok(())
+}
+
+/// Forwards llama-server to a free local port and keeps the tunnel open until Ctrl-C.
+fn tunnel(m: &Model, id: u64, key: &std::path::Path, host: &str, port: u16) -> Result<()> {
+    let local = free_port(REMOTE_PORT)?;
+    let mut child = Command::new("ssh")
+        .args(ssh_command(key, host, port).into_iter().skip(1))
+        .args([
+            "-N",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ServerAliveInterval=30",
+        ])
+        .args(["-L", &format!("{local}:127.0.0.1:{REMOTE_PORT}")])
+        .spawn()
+        .context("running ssh")?;
+    eprintln!(
+        "\nServing {name} at http://localhost:{local}/v1 (OpenAI-compatible). Try:\n",
+        name = m.name
+    );
+    println!(
+        "curl http://localhost:{local}/v1/chat/completions -H 'Content-Type: application/json' \
+         -d '{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}'",
+        m.name
+    );
+    eprintln!(
+        "\nCtrl-C closes the tunnel. The GPU keeps billing until `vastx down {id}`; \
+         `vastx connect {id}` reopens the tunnel."
+    );
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("the tunnel closed ({status})");
+    }
+    Ok(())
+}
+
+/// `preferred` if nothing is listening there, otherwise the next free port above it.
+fn free_port(preferred: u16) -> Result<u16> {
+    (preferred..preferred.saturating_add(100))
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .context("no free local port for the tunnel")
+}
+
+fn cmd_connect(id: u64) -> Result<()> {
+    let config = require_login()?;
+    let vast = Vast::new(config.vast_api_key);
+    let inst = vast
+        .instance(id)?
+        .with_context(|| format!("no vastx instance {id}; `vastx ps` lists them"))?;
+    let model = MODELS
+        .iter()
+        .find(|m| m.name == inst.model)
+        .with_context(|| {
+            format!(
+                "instance {id} runs {}, which vastx doesn't know",
+                inst.model
+            )
+        })?;
+    let (host, port) = inst
+        .ssh
+        .with_context(|| format!("instance {id} isn't reachable yet ({})", inst.status))?;
+    let key = ensure_ssh_key(&vast)?;
+    setup(model, &key, &host, port)?;
+    tunnel(model, id, &key, &host, port)
 }
 
 fn cmd_ps() -> Result<()> {
@@ -898,6 +1045,7 @@ fn main() -> Result<()> {
         Some(Cmd::Gpus { model }) => cmd_gpus(model.as_deref())?,
         Some(Cmd::Up { model }) => cmd_up(model.as_deref())?,
         Some(Cmd::Ps) => cmd_ps()?,
+        Some(Cmd::Connect { id }) => cmd_connect(id)?,
         Some(Cmd::Down { id }) => cmd_down(id)?,
         None => cmd_up(None)?,
     }
@@ -938,62 +1086,65 @@ mod tests {
     }
 
     #[test]
-    fn index_decides_weights_and_skips_duplicates() {
-        // Shape of mistralai/Mistral-7B-Instruct-v0.3: consolidated weights next to HF shards.
+    fn gguf_size_comes_from_the_tree() {
         let tree = json!([
-            {"type": "file", "path": "consolidated.safetensors", "size": 14_500},
-            {"type": "file", "path": "model-00001-of-00002.safetensors", "size": 5_000},
-            {"type": "file", "path": "model-00002-of-00002.safetensors", "size": 4_500},
-            {"type": "file", "path": SAFETENSORS_INDEX, "size": 20},
-            {"type": "file", "path": "config.json", "size": 1},
-            {"type": "file", "path": "tokenizer.model", "size": 2},
-            {"type": "file", "path": "README.md", "size": 4},
-            {"type": "file", "path": "original/params.json", "size": 5},
-            {"type": "directory", "path": "original", "size": 0}
+            {"type": "file", "path": "Qwen3-8B-Q4_K_M.gguf", "size": 5_027_783_488u64},
+            {"type": "file", "path": "Qwen3-8B-Q8_0.gguf", "size": 8_709_518_624u64}
         ]);
-        let index = json!({"weight_map": {
-            "a": "model-00001-of-00002.safetensors",
-            "b": "model-00001-of-00002.safetensors",
-            "c": "model-00002-of-00002.safetensors"
-        }});
-        let info = ModelInfo::from_parts(&tree, Some(&index), &qwen_config()).unwrap();
-        assert_eq!(info.weight_bytes, 9_500);
-        let names: Vec<_> = info.files.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors",
-                SAFETENSORS_INDEX,
-                "config.json",
-                "tokenizer.model",
-            ]
-        );
-    }
-
-    #[test]
-    fn single_file_weights() {
-        let tree = json!([
-            {"type": "file", "path": "model.safetensors", "size": 3_000},
-            {"type": "file", "path": "config.json", "size": 1}
-        ]);
-        let info = ModelInfo::from_parts(&tree, None, &qwen_config()).unwrap();
-        assert_eq!(info.weight_bytes, 3_000);
-        let empty = json!([{"type": "file", "path": "config.json", "size": 1}]);
-        assert!(ModelInfo::from_parts(&empty, None, &qwen_config()).is_err());
+        let info = ModelInfo::from_parts(&tree, "Qwen3-8B-Q4_K_M.gguf", &qwen_config()).unwrap();
+        assert_eq!(info.weight_bytes, 5_027_783_488);
+        assert!(ModelInfo::from_parts(&tree, "missing.gguf", &qwen_config()).is_err());
     }
 
     #[test]
     fn vram_estimate() {
         let info = ModelInfo {
-            files: vec![],
-            weight_bytes: 15 * (1 << 30),
+            weight_bytes: 5 * (1 << 30),
             arch: Arch::from_config(&qwen_config()).unwrap(),
         };
         assert_eq!(info.context(), 8192);
         // KV: 2 * 28 layers * 4 heads * 128 dim * 2 bytes * 8192 tokens = 448 MiB.
-        let expected = (15.0 * GIB + 448.0 * 1024.0 * 1024.0 + 2.0 * GIB) / 0.9;
-        assert_eq!(info.vram_bytes(), expected as u64);
+        assert_eq!(info.vram_bytes(), 6 * (1 << 30) + 448 * (1 << 20));
+    }
+
+    #[test]
+    fn setup_script_is_pinned_and_idempotent() {
+        let m = &MODELS[1];
+        let s = setup_script(m, 8192);
+        assert!(
+            s.contains("releases/download/b12777/llama-b12777-bin-ubuntu-cuda-12.8-x64.tar.gz")
+        );
+        assert!(s.contains(
+            "releases/download/b12777/cudart-llama-b12777-bin-ubuntu-cuda-12.8-x64.tar.gz"
+        ));
+        assert!(s.contains(&format!(
+            "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/{}/Qwen3-8B-Q4_K_M.gguf",
+            m.gguf_revision
+        )));
+        assert!(s.contains("--alias qwen3-8b"));
+        assert!(s.contains("-c 8192 --host 127.0.0.1 --port 8080"));
+        for guard in [
+            "if [ ! -x /opt/llama/llama-server ]",
+            "if [ ! -f /workspace/models/",
+            "if ! curl -sf",
+        ] {
+            assert!(s.contains(guard), "{guard}");
+        }
+    }
+
+    #[test]
+    fn free_port_skips_busy_ones() {
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = busy.local_addr().unwrap().port();
+        assert_ne!(free_port(p).unwrap(), p);
+    }
+
+    #[test]
+    fn model_names_are_unique() {
+        let mut names: Vec<_> = MODELS.iter().map(|m| m.name).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), MODELS.len());
     }
 
     #[test]
@@ -1096,13 +1247,12 @@ mod tests {
     }
 
     #[test]
-    fn disk_covers_weights_and_image() {
+    fn disk_covers_weights_and_llama() {
         let info = ModelInfo {
-            files: vec![],
-            weight_bytes: 15_200_000_000,
+            weight_bytes: 5_027_783_488,
             arch: Arch::from_config(&qwen_config()).unwrap(),
         };
-        assert_eq!(disk_gb(&info), 56);
+        assert_eq!(disk_gb(&info), 16);
     }
 
     #[test]
