@@ -1,6 +1,8 @@
 # vastx
 
-vastx makes it easy to run open models if you don't have a GPU. There are some other benefits but this is mostly just a recreational exercise for me.
+vastx makes it easy to run open models if you don't have a GPU.
+
+There are some other benefits but this is mostly just a recreational exercise for me.
 
 ## Setup
 
@@ -9,8 +11,6 @@ git clone https://github.com/ridoy/vastx.git
 cd vastx
 cargo install --path .
 ```
-
-`VASTX_S3_ENDPOINT` points vastx at any other S3-compatible store.
 
 ## Usage
 
